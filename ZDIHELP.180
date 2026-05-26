@@ -1,0 +1,192 @@
+; Helper functions for eZ80F91 Flash loading through Zilog Debug Interface
+; 23.05.26 dr'Zed
+
+; Abstract: 
+; ZDI allows writing of values to eZ80 memory space. There is no way to write
+; to I/O-Space directly, despite cranking ld <reg>,val and out0 opcodes through
+; the debuggers instruction port. Thats horribly slow and i dont like it. 
+; A small helper-program comes to rescue, that issues the needed I/O-Accesses and transfers Data
+; from RAM to Flash.
+; It is loaded through ZDI into the internal SRAM of the eZ80F91. 
+; Prior to this, the SRAM Memory needs to be relocated into 64k Page 0.
+; This Code is then uploaded to Adr. 0xE000.
+; Furthermore there needs to be a Breakpoint set to the address at offset [5] in this code.
+; It is used to detect an "end of operation" through ZDI.
+; Note: ADL Mode needs to be disabled prior to jumping into this code! (via ZDI or whatever)
+
+; To erase 2048 bytes of Flash ( 1 Page )
+;  With ZDI issue the following commands:
+;  1. Load 0xAA to A
+;  2. Write Page to erase to H
+;  3. Set PC to [PARKPOS+3]
+;  4. Release Break with enabled Brakepoint 0.
+;  5. Wait until Breakpoint 0 is reached.
+;  6. Read result code from A
+
+; To write 256 bytes of Flash ( 1 Row )
+;  With ZDI issue the following commands:
+;  1. Load 0xC3 to A
+;  2. Write Page and Row to program to HL
+;  3. Download 256 bytes to program to the address pointed to by
+;     pointer at [7] in this code.
+;  4. Set PC to [PARKPOS+3]
+;  5. Release Break with enabled Brakepoint 0.
+;  6. Wait until Breakpoint 0 is reached.
+;  7. Read result code from A
+
+
+CMD_PGM_ROW     equ 0C3h
+CMD_ERA_PAGE    equ 0AAh
+CMD_VER_ROW     equ 03Ch
+
+ERR_INVCMD      equ 0F0h
+ERR_PG_ERASE    equ 0F1h
+ERR_PGM         equ 0F2h
+ERR_VERIFY      equ 0F3h
+
+F_KEY0          equ 0B6h
+F_KEY1          equ 49h
+FLASH_KEY       equ 00F5h
+FLASH_DATA      equ 00F6h
+FLASH_ADDR_U    equ 00F7h
+FLASH_CTRL      equ 00F8h
+FLASH_FDIV      equ 00F9h
+FLASH_PROT      equ 00FAh
+
+FLASH_IRQ       equ 00FBh
+IRQ_DONE        equ 020h
+IRQ_WR_VIO      equ 008h
+IRQ_TMO         equ 004h
+IRQ_PG_VIO      equ 002h
+IRQ_MASS_VIO    equ 001h
+        
+FLASH_PAGE      equ 00FCh
+FLASH_ROW       equ 00FDh
+FLASH_COL       equ 00FEh
+        
+FLASH_PGCTL     equ 00FFh
+
+PGCTL_ROW_PGM   equ 004h
+PGCTL_PG_ERASE  equ 002h
+PGCTL_MASS_ERA  equ 001h
+
+RAM_ADDR_U      equ 00B5h
+
+        org 0E000h   ; 0x00:E000 is the internal RAM after Relocation to 64k-Block 0
+
+        jp init 
+        dw 0AA55h    ; @ 0003h 2b Magic 
+        dw park      ; @ 0005h 2b Address of "parking position"
+        dw Data      ; @ 0007h 2b Address of data buffer 
+
+init:   ld sp,0FFFFh
+
+park:   jp $          ; Breakpoint and "parking position" 
+        jp exec_cmd   ; Jump here using ZDI to execute an operation selected by 
+                      ; value in register A, Status is reported back in reg a
+        ;   ... room for more jumps, if needed in the future
+
+exec_cmd:
+        ld sp, 0FFFFh
+        push af
+        call setup_fl
+        pop af
+
+        cp CMD_PGM_ROW
+        jr z, pgm_row
+        cp CMD_ERA_PAGE
+        jr z, era_page
+        cp CMD_VER_ROW
+        jr z, verify_row
+        ld a,ERR_INVCMD
+        jr park
+
+setup_fl:
+        ld a, F_KEY0            ; Key 0
+        out0 (FLASH_KEY), a
+        ld a, F_KEY1            ; Key 1
+        out0 (FLASH_KEY), a
+        ld a, 198               ; Flash divider (6 us at 33 MHz CPU-CLK)
+        out0 (FLASH_FDIV),a 
+        ld a, F_KEY0            ; Key 0
+        out0 (FLASH_KEY), a
+        ld a, F_KEY1            ; Key 1
+        out0 (FLASH_KEY), a
+        xor a
+        out0 (FLASH_PROT), a    ; Unlock all Flash Pages. Despite Page0 if locked via WP Jumper!
+        ret
+
+era_page:
+        call erase_pg   
+        jp park
+
+
+; Erase a single Page. The address needs to be in "H"
+erase_pg:
+        out0 (FLASH_PAGE),h     ; write page to page reg.
+        ld a, PGCTL_PG_ERASE    
+        out0 (FLASH_PGCTL), a   ; Start Page erase operation
+wait_era:
+        in0 a,(FLASH_IRQ)   
+        ld (FIRQ_Bits),a
+        and IRQ_DONE + IRQ_PG_VIO
+        jr z, wait_era          ; Wait until DONE or Page Violation
+        ld a,(FIRQ_Bits)
+        and IRQ_PG_VIO          ; Mask Protection Violation-Flag
+        jr nz, era_errprot
+        xor a 
+        ret
+
+era_errprot:
+        ld a, ERR_PG_ERASE
+        ret
+
+
+; Program a Flash Row (H=Page, L=Column (256bytes))
+pgm_row:
+        xor a
+        out0 (FLASH_COL),a
+        out0 (FLASH_PAGE),h
+        out0 (FLASH_ROW),l     
+        push hl                 ; Save row and column for verify
+        ld hl, Data
+        ld de, FLASH_DATA
+        ld bc, 256              ; program 256 bytes at once with block-i/o
+        ld a,PGCTL_ROW_PGM      ; Issue a Write Row Command
+        out0 (FLASH_PGCTL),a    
+        db 0EDh
+        db 0C3h                 ; OTIRX -> load 256 byte
+        pop hl
+waitpgm:
+        in0 a,(FLASH_IRQ)       ; Read Flags
+        ld (FIRQ_Bits),a
+        and (IRQ_DONE + IRQ_TMO + IRQ_WR_VIO)
+        jr z,waitpgm            ; wait for either flags to be set
+        ld a,(FIRQ_Bits)
+        and (IRQ_TMO + IRQ_WR_VIO)
+        jr z, verify_row
+        ld a,ERR_PGM            ; Otherwise store ERR_PGM as return value
+        jp park                 ; and trigger the breakpoint
+
+verify_row:
+        out0 (FLASH_PAGE),h
+        out0 (FLASH_ROW),l
+        
+        ld hl, Data             ; HL to start of data
+        ld b,0
+ver_loop:
+        in0 a,(FLASH_DATA)      ; read flash data (autoincrement)
+        cp (hl)                 ; check against original data
+        jr nz, ver_error        ; different? -> error and exit
+        inc hl  
+        djnz ver_loop           ; continue 256 times
+        xor a                   ; Clear a for no error
+        jp park                 ; exit by triggering the breakpoint
+    
+ver_error:
+        ld a,ERR_VERIFY
+        jp park
+
+FIRQ_Bits: db 0
+Data:   db 0  ; -> 256 bytes for program-row command follow...
+

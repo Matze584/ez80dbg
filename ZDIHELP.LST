@@ -1,0 +1,209 @@
+SLR180 SuperFast Relocating Macro Assembler     	    SLR180 1.31 Page   1
+ZDIHELP 180
+
+    1                   ; Helper functions for eZ80F91 Flash loading through Zilog Debug Interface
+    2                   ; 2.6.24 dr'Zed
+    3                   
+    4                   ; Abstract: 
+    5                   ; ZDI allows writing of values to eZ80 memory space. There is no way to write
+    6                   ; to I/O-Space directly, despite cranking ld <reg>,val and out0 opcodes through
+    7                   ; the debuggers instruction port. Thats horribly slow and i dont like it. 
+    8                   ; A small helper-program comes to rescue, that issues the needed I/O-Accesses and transfers Data
+    9                   ; from RAM to Flash.
+   10                   ; It is loaded through ZDI into the internal SRAM of the eZ80F91. 
+   11                   ; Prior to this, the SRAM Memory needs to be relocated into 64k Page 0.
+   12                   ; This Code is then uploaded to Adr. 0xE000.
+   13                   ; Furthermore there needs to be a Breakpoint set to the address at offset [5] in this code.
+   14                   ; It is used to detect an "end of operation" through ZDI.
+   15                   ; Note: ADL Mode needs to be disabled prior to jumping into this code! (via ZDI or whatever)
+   16                   
+   17                   ; To erase 2048 bytes of Flash ( 1 Page )
+   18                   ;  With ZDI issue the following commands:
+   19                   ;  1. Load 0xAA to A
+   20                   ;  2. Write Page to erase to H
+   21                   ;  3. Set PC to [PARKPOS+3]
+   22                   ;  4. Release Break with enabled Brakepoint 0.
+   23                   ;  5. Wait until Breakpoint 0 is reached.
+   24                   ;  6. Read result code from A
+   25                   
+   26                   ; To write 256 bytes of Flash ( 1 Row )
+   27                   ;  With ZDI issue the following commands:
+   28                   ;  1. Load 0xC3 to A
+   29                   ;  2. Write Page and Row to program to HL
+   30                   ;  3. Download 256 bytes to program to the address pointed to by
+   31                   ;     pointer at [7] in this code.
+   32                   ;  4. Set PC to [PARKPOS+3]
+   33                   ;  5. Release Break with enabled Brakepoint 0.
+   34                   ;  6. Wait until Breakpoint 0 is reached.
+   35                   ;  7. Read result code from A
+   36                   
+   37                   
+   38         00C3      CMD_PGM_ROW     equ 0C3h
+   39         00AA      CMD_ERA_PAGE    equ 0AAh
+   40         003C      CMD_VER_ROW     equ 03Ch
+   41                   
+   42         00F0      ERR_INVCMD      equ 0F0h
+   43         00F1      ERR_PG_ERASE    equ 0F1h
+   44         00F2      ERR_PGM         equ 0F2h
+   45         00F3      ERR_VERIFY      equ 0F3h
+   46                   
+   47         00B6      F_KEY0          equ 0B6h
+   48         0049      F_KEY1          equ 49h
+   49         00F5      FLASH_KEY       equ 00F5h
+   50         00F6      FLASH_DATA      equ 00F6h
+   51         00F7      FLASH_ADDR_U    equ 00F7h
+   52         00F8      FLASH_CTRL      equ 00F8h
+   53         00F9      FLASH_FDIV      equ 00F9h
+   54         00FA      FLASH_PROT      equ 00FAh
+   55                   
+   56         00FB      FLASH_IRQ       equ 00FBh
+   57         0020      IRQ_DONE        equ 020h
+   58         0008      IRQ_WR_VIO      equ 008h
+SLR180 SuperFast Relocating Macro Assembler     	    SLR180 1.31 Page   2
+ZDIHELP 180
+
+   59         0004      IRQ_TMO         equ 004h
+   60         0002      IRQ_PG_VIO      equ 002h
+   61         0001      IRQ_MASS_VIO    equ 001h
+   62                           
+   63         00FC      FLASH_PAGE      equ 00FCh
+   64         00FD      FLASH_ROW       equ 00FDh
+   65         00FE      FLASH_COL       equ 00FEh
+   66                           
+   67         00FF      FLASH_PGCTL     equ 00FFh
+   68                   
+   69         0004      PGCTL_ROW_PGM   equ 004h
+   70         0002      PGCTL_PG_ERASE  equ 002h
+   71         0001      PGCTL_MASS_ERA  equ 001h
+   72                   
+   73         00B5      RAM_ADDR_U      equ 00B5h
+   74                   
+   75         E000              org 0E000h   ; 0x00:E000 is the internal RAM after Relocation to 64k-Block 0
+   76                   
+   77 E000  C3 E009             jp init 
+   78 E003  AA55                dw 0AA55h    ; @ 0003h 2b Magic 
+   79 E005  E00C                dw park      ; @ 0005h 2b Address of "parking position"
+   80 E007  E0BC                dw Data      ; @ 0007h 2b Address of data buffer 
+   81                   
+   82 E009  31 FFFF     init:   ld sp,0FFFFh
+   83                   
+   84 E00C  C3 E00C     park:   jp $          ; Breakpoint and "parking position" 
+   85 E00F  C3 E012             jp exec_cmd   ; Jump here using ZDI to execute an operation selected by 
+   86                                         ; value in register A, Status is reported back in reg a
+   87                           ;   ... room for more jumps, if needed in the future
+   88                   
+   89 E012              exec_cmd:
+   90 E012  31 FFFF             ld sp, 0FFFFh
+   91 E015  F5                  push af
+   92 E016  CD E02A             call setup_fl
+   93 E019  F1                  pop af
+   94                   
+   95 E01A  FE C3               cp CMD_PGM_ROW
+   96 E01C  28 4E               jr z, pgm_row
+   97 E01E  FE AA               cp CMD_ERA_PAGE
+   98 E020  28 26               jr z, era_page
+   99 E022  FE 3C               cp CMD_VER_ROW
+  100 E024  28 78               jr z, verify_row
+  101 E026  3E F0               ld a,ERR_INVCMD
+  102 E028  18 E2               jr park
+  103                   
+  104 E02A              setup_fl:
+  105 E02A  3E B6               ld a, F_KEY0            ; Key 0
+  106 E02C  ED 39 F5            out0 (FLASH_KEY), a
+  107 E02F  3E 49               ld a, F_KEY1            ; Key 1
+  108 E031  ED 39 F5            out0 (FLASH_KEY), a
+  109 E034  3E C6               ld a, 198               ; Flash divider (6 us at 33 MHz CPU-CLK)
+  110 E036  ED 39 F9            out0 (FLASH_FDIV),a 
+  111 E039  3E B6               ld a, F_KEY0            ; Key 0
+  112 E03B  ED 39 F5            out0 (FLASH_KEY), a
+  113 E03E  3E 49               ld a, F_KEY1            ; Key 1
+  114 E040  ED 39 F5            out0 (FLASH_KEY), a
+  115 E043  AF                  xor a
+  116 E044  ED 39 FA            out0 (FLASH_PROT), a    ; Unlock all Flash Pages. Despite Page0 if locked via WP Jumper!
+SLR180 SuperFast Relocating Macro Assembler     	    SLR180 1.31 Page   3
+ZDIHELP 180
+
+  117 E047  C9                  ret
+  118                   
+  119 E048              era_page:
+  120 E048  CD E04E             call erase_pg   
+  121 E04B  C3 E00C             jp park
+  122                   
+  123                   
+  124                   ; Erase a single Page. The address needs to be in "H"
+  125 E04E              erase_pg:
+  126 E04E  ED 21 FC            out0 (FLASH_PAGE),h     ; write page to page reg.
+  127 E051  3E 02               ld a, PGCTL_PG_ERASE    
+  128 E053  ED 39 FF            out0 (FLASH_PGCTL), a   ; Start Page erase operation
+  129 E056              wait_era:
+  130 E056  ED 38 FB            in0 a,(FLASH_IRQ)   
+  131 E059  32 E0BB             ld (FIRQ_Bits),a
+  132 E05C  E6 22               and IRQ_DONE + IRQ_PG_VIO
+  133 E05E  28 F6               jr z, wait_era          ; Wait until DONE or Page Violation
+  134 E060  3A E0BB             ld a,(FIRQ_Bits)
+  135 E063  E6 02               and IRQ_PG_VIO          ; Mask Protection Violation-Flag
+  136 E065  20 02               jr nz, era_errprot
+  137 E067  AF                  xor a 
+  138 E068  C9                  ret
+  139                   
+  140 E069              era_errprot:
+  141 E069  3E F1               ld a, ERR_PG_ERASE
+  142 E06B  C9                  ret
+  143                   
+  144                   
+  145                   ; Program a Flash Row (H=Page, L=Column (256bytes))
+  146 E06C              pgm_row:
+  147 E06C  AF                  xor a
+  148 E06D  ED 39 FE            out0 (FLASH_COL),a
+  149 E070  ED 21 FC            out0 (FLASH_PAGE),h
+  150 E073  ED 29 FD            out0 (FLASH_ROW),l     
+  151 E076  E5                  push hl                 ; Save row and column for verify
+  152 E077  21 E0BC             ld hl, Data
+  153 E07A  11 00F6             ld de, FLASH_DATA
+  154 E07D  01 0100             ld bc, 256              ; program 256 bytes at once with block-i/o
+  155 E080  3E 04               ld a,PGCTL_ROW_PGM      ; Issue a Write Row Command
+  156 E082  ED 39 FF            out0 (FLASH_PGCTL),a    
+  157 E085  ED                  db 0EDh
+  158 E086  C3                  db 0C3h                 ; OTIRX -> load 256 byte
+  159 E087  E1                  pop hl
+  160 E088              waitpgm:
+  161 E088  ED 38 FB            in0 a,(FLASH_IRQ)       ; Read Flags
+  162 E08B  32 E0BB             ld (FIRQ_Bits),a
+  163 E08E  E6 2C               and (IRQ_DONE + IRQ_TMO + IRQ_WR_VIO)
+  164 E090  28 F6               jr z,waitpgm            ; wait for either flags to be set
+  165 E092  3A E0BB             ld a,(FIRQ_Bits)
+  166 E095  E6 0C               and (IRQ_TMO + IRQ_WR_VIO)
+  167 E097  28 05               jr z, verify_row
+  168 E099  3E F2               ld a,ERR_PGM            ; Otherwise store ERR_PGM as return value
+  169 E09B  C3 E00C             jp park                 ; and trigger the breakpoint
+  170                   
+  171 E09E              verify_row:
+  172 E09E  ED 21 FC            out0 (FLASH_PAGE),h
+  173 E0A1  ED 29 FD            out0 (FLASH_ROW),l
+  174                           
+SLR180 SuperFast Relocating Macro Assembler     	    SLR180 1.31 Page   4
+ZDIHELP 180
+
+  175 E0A4  21 E0BC             ld hl, Data             ; HL to start of data
+  176 E0A7  06 00               ld b,0
+  177 E0A9              ver_loop:
+  178 E0A9  ED 38 F6            in0 a,(FLASH_DATA)      ; read flash data (autoincrement)
+  179 E0AC  BE                  cp (hl)                 ; check against original data
+  180 E0AD  20 07               jr nz, ver_error        ; different? -> error and exit
+  181 E0AF  23                  inc hl  
+  182 E0B0  10 F7               djnz ver_loop           ; continue 256 times
+  183 E0B2  AF                  xor a                   ; Clear a for no error
+  184 E0B3  C3 E00C             jp park                 ; exit by triggering the breakpoint
+  185                       
+  186 E0B6              ver_error:
+  187 E0B6  3E F3               ld a,ERR_VERIFY
+  188 E0B8  C3 E00C             jp park
+  189                   
+  190 E0BB  00          FIRQ_Bits: db 0
+  191 E0BC  00          Data:   db 0  ; -> 256 bytes for program-row command follow...
+  192                   
+ 0 Error(s) Detected.
+ 189 Absolute Bytes. 44 Symbols Detected.
+0               ld b,0
+  177 E0A9              ver_loop:
+  178 E0A9  ED 38 F6            in0 a,(FLASH_DATA)   

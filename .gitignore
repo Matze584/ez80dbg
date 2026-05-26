@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# old implementation / reference
+old/
+
+# PNG images of eZ80 Opcodemaps (due to copyright no upload to gh)
+opmaps/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.eggs/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# But keep these HEX/LST files — they are from/for the prebuilt ZDI helper blob
+!zdihelp.hex
+!zdihelp.lst
+!zdihelp.180
