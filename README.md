@@ -142,6 +142,7 @@ connection.
 |---|---|
 | [pyftdi](https://github.com/eblot/pyftdi) | FTDI USB adapter access via libusb |
 | [intelhex](https://github.com/python-intelhex/intelhex) | Intel HEX file parsing |
+| [ez80dis](https://github.com/Matze584/ez80dis) | eZ80 Disassembler |
 | tkinter | GUI Framework |
 
 Install via `setup.sh` / `setup.bat`, or manually:
