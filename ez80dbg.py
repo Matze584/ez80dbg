@@ -380,9 +380,14 @@ class ZDIDebugger:
     # ---- Register / memory access -----------------------------------------
 
     def write_pc(self, addr: int):
+        was_adl = self.is_adl()
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
         self._zdi_write_multiple(ZDI_WR_DATA_L, [
             addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF, RWCTL_WRITE_PC
         ])
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
 
     def read_pc(self) -> int:
         self._zdi_write_reg(ZDI_RW_CTL, RWCTL_READ_PC)
@@ -391,6 +396,10 @@ class ZDIDebugger:
 
     def read_all_regs(self) -> dict:
         r = {}
+
+        orig_adl = bool(self._zdi_read_reg(ZDI_STAT) & STAT_ADL)
+        if not orig_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
 
         # Primary registers (SP handled separately)
         for cmd, keys in (
@@ -407,25 +416,15 @@ class ZDIDebugger:
             for k, v in zip(keys, vals):
                 r[k] = v
 
-        # RWCTL_READ_SP returns SPL in ADL mode, SPS in Z80 mode.
-        # Toggle ADL once to read the other SP, then restore.
-        adl_active = bool(self._zdi_read_reg(ZDI_STAT) & STAT_ADL)
+        # READ_SP in ADL mode → SPL; toggle to Z80 → SPS; toggle back.
         self._zdi_write_reg(ZDI_RW_CTL, RWCTL_READ_SP)
         b = self._zdi_read_multiple(ZDI_RD_L, 3)
-        if adl_active:
-            r['SPL_L'], r['SPL_H'], r['SPL_U'] = b[0], b[1], b[2]
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_READ_SP)
-            b2 = self._zdi_read_multiple(ZDI_RD_L, 3)
-            r['SPS_L'], r['SPS_H'] = b2[0], b2[1]
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
-        else:
-            r['SPS_L'], r['SPS_H'] = b[0], b[1]
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_READ_SP)
-            b2 = self._zdi_read_multiple(ZDI_RD_L, 3)
-            r['SPL_L'], r['SPL_H'], r['SPL_U'] = b2[0], b2[1], b2[2]
-            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
+        r['SPL_L'], r['SPL_H'], r['SPL_U'] = b[0], b[1], b[2]
+        self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
+        self._zdi_write_reg(ZDI_RW_CTL, RWCTL_READ_SP)
+        b2 = self._zdi_read_multiple(ZDI_RD_L, 3)
+        r['SPS_L'], r['SPS_H'] = b2[0], b2[1]
+        self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
 
         # Second register bank: EXCHG swaps primary ↔ shadow, read, swap back.
         self._zdi_write_reg(ZDI_RW_CTL, RWCTL_EXCHG)
@@ -442,6 +441,9 @@ class ZDIDebugger:
                     r[k] = v
         self._zdi_write_reg(ZDI_RW_CTL, RWCTL_EXCHG)
 
+        if not orig_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
+
         return r
 
     _READ_CHUNK = 256
@@ -449,25 +451,38 @@ class ZDIDebugger:
     def read_mem(self, addr: int, count: int, progress=None) -> list:
         """Read count bytes from addr in chunks. CPU must be halted.
         progress: optional callable invoked after each chunk (e.g. for dots)."""
-        self._zdi_write_multiple(ZDI_WR_DATA_L, [
-            addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF, RWCTL_WRITE_PC
-        ])
+        was_adl = self.is_adl()
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
         result = []
         remaining = count
+        offset = 0
         while remaining:
             n = min(remaining, self._READ_CHUNK)
+            self._zdi_write_multiple(ZDI_WR_DATA_L, [
+                (addr + offset) & 0xFF, ((addr + offset) >> 8) & 0xFF,
+                ((addr + offset) >> 16) & 0xFF, RWCTL_WRITE_PC
+            ])
             result += self._zdi_read_multiple(ZDI_RD_MEM, n)
             remaining -= n
+            offset += n
             if progress:
                 progress()
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
         return result
 
     def write_mem(self, addr: int, data):
         """Write bytes to addr via ZDI auto-increment sequential write."""
+        was_adl = self.is_adl()
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_SET_ADL)
         self._zdi_write_multiple(ZDI_WR_DATA_L, [
             addr & 0xFF, (addr >> 8) & 0xFF, (addr >> 16) & 0xFF, RWCTL_WRITE_PC
         ])
         self._zdi_write_multiple(ZDI_WR_MEM, data)
+        if not was_adl:
+            self._zdi_write_reg(ZDI_RW_CTL, RWCTL_RES_ADL)
 
     # ---- Flash programming ------------------------------------------------
 
@@ -583,8 +598,12 @@ def _flags_str(f: int) -> str:
         'N' if f & 0x02 else 'n', 'C' if f & 0x01 else 'c',
     ])
 
+def phys_pc(regs: dict, adl: bool) -> int:
+    upper = regs['PCU'] if adl else regs['MBASE']
+    return regs['PCL'] | (regs['PCH'] << 8) | (upper << 16)
+
 def print_regs(regs: dict, adl: bool = False):
-    pc  = regs['PCL'] | (regs['PCH'] << 8) | (regs['PCU'] << 16)
+    pc  = phys_pc(regs, adl)
     spl = regs['SPL_L'] | (regs['SPL_H'] << 8) | (regs['SPL_U'] << 16)
     sps = regs['SPS_L'] | (regs['SPS_H'] << 8)
     bc  = (regs['BCU'] << 16) | (regs['B']   << 8) | regs['C']
@@ -612,16 +631,19 @@ def print_regs(regs: dict, adl: bool = False):
         print(f"  DE'={pde:06X}")  
         print(f"  HL'={phl:06X}")
 
+def raw_pc(regs: dict) -> int:
+    return regs['PCL'] | (regs['PCH'] << 8) | (regs['PCU'] << 16)
+
 def print_pc_insn(dbg: ZDIDebugger, regs: dict):
     """Print bytes + optional disassembly at current PC, then restore PC."""
-    pc  = regs['PCL'] | (regs['PCH'] << 8) | (regs['PCU'] << 16)
+    adl = dbg.is_adl()
+    pc  = phys_pc(regs, adl)
     mem = dbg.read_mem(pc, 8)
-    dbg.write_pc(pc)
+    dbg.write_pc(raw_pc(regs))
     h = ' '.join(f'{b:02X}' for b in mem)
     disasm = ''
     if HAS_DISASM:
         try:
-            adl    = dbg.is_adl()
             dec    = ez80dis.decode(mem, pc, adl)
             disasm = f'  =>  {ez80dis.disasm(dec)}'
         except Exception:
@@ -658,8 +680,9 @@ def interactive_step(dbg: ZDIDebugger):
                 break
 
         regs = dbg.read_all_regs()
-        pc   = regs['PCL'] | (regs['PCH'] << 8) | (regs['PCU'] << 16)
-        print_regs(regs, dbg.is_adl())
+        adl  = dbg.is_adl()
+        pc   = phys_pc(regs, adl)
+        print_regs(regs, adl)
         print_pc_insn(dbg, regs)
 
         try:
@@ -701,7 +724,7 @@ def interactive_step(dbg: ZDIDebugger):
                 addr   = int(parts[0], 16)
                 length = int(parts[1], 16) if len(parts) > 1 else 0x40
                 data   = dbg.read_mem(addr, length)
-                dbg.write_pc(pc)
+                dbg.write_pc(raw_pc(regs))
                 hex_dump(data, addr)
             except (ValueError, IndexError):
                 print("  Usage:  m <addr_hex> [len_hex]")
@@ -1000,7 +1023,9 @@ def launch_gui(device: str):
             self.md_len = ttk.Entry(row2, width=5)
             self.md_len.insert(0, '80')
             self.md_len.pack(side='left', padx=2)
-            ttk.Button(mf, text="Dump", command=self._mem_dump).pack(pady=2)
+            btn_row = ttk.Frame(mf); btn_row.pack(pady=2)
+            ttk.Button(btn_row, text="Dump", command=self._mem_dump).pack(side='left', padx=2)
+            ttk.Button(btn_row, text="Save", command=self._mem_save).pack(side='left', padx=2)
 
             jf = ttk.LabelFrame(parent, text="Set PC / Run from", padding=4)
             jf.pack(fill='x', padx=4, pady=2)
@@ -1247,7 +1272,7 @@ def launch_gui(device: str):
                 t.config(state='disabled')
                 self._prev_regs = dict(regs)
 
-                pc = regs['PCL'] | (regs['PCH'] << 8) | (regs['PCU'] << 16)
+                pc = phys_pc(regs, adl)
 
                 _indicators = [
                     ('ADL',  adl,   'ADL',  'Z80',  '#00cc44', '#1a3a1a', '#ffaa00', '#2a2000'),
@@ -1263,7 +1288,7 @@ def launch_gui(device: str):
                         var.set(off_text); lbl.config(fg=off_fg, bg=off_bg)
 
                 mem = self.dbg.read_mem(pc, 8)
-                self.dbg.write_pc(pc)
+                self.dbg.write_pc(raw_pc(regs))
                 h = ' '.join(f'{b:02X}' for b in mem)
                 disasm = ''
                 if HAS_DISASM:
@@ -1315,6 +1340,28 @@ def launch_gui(device: str):
                 self._log("Bad address / length")
             except Exception as e:
                 self._log(f"Dump failed: {e}")
+
+        def _mem_save(self):
+            if not self._need_dbg(): return
+            try:
+                addr   = int(self.md_addr.get().strip(), 16)
+                length = int(self.md_len.get().strip(), 16)
+            except ValueError:
+                self._log("Bad address / length"); return
+            path = filedialog.asksaveasfilename(
+                defaultextension='.bin',
+                initialfile=f'{addr:06X}_{length:X}.bin',
+                filetypes=[('Binary', '*.bin'), ('All', '*.*')])
+            if not path: return
+            try:
+                saved = self.dbg.read_pc()
+                data  = self.dbg.read_mem(addr, length)
+                self.dbg.write_pc(saved)
+                with open(path, 'wb') as f:
+                    f.write(bytes(data))
+                self._log(f"Saved {length} bytes from {addr:06X} to {path}")
+            except Exception as e:
+                self._log(f"Save failed: {e}")
 
         def _flash_dialog(self):
             if not self._need_dbg(): return
