@@ -19,6 +19,7 @@ Features
 - Register dump with inline eZ80/Z80 disassembly at PC (ADL-aware)
 - Hex memory dump
 - Tkinter GUI with register panel, runtime disassembly and output log
+- Unix-socket monitor, protocol-compatible with NGZ80Evo_Tools_Emu --monitor
 - eZ80 ADL Mode aware disassembler (ez80dis.py, based on z80dis)
 
 Supported hardware
@@ -44,6 +45,7 @@ CLI usage
   ez80dbg.py dump   <addr>     [length]
   ez80dbg.py regs
   ez80dbg.py reset  [--run ADDR]
+  ez80dbg.py monitor [socket] [--attach]     (default socket: /tmp/ez80dbg.sock)
   ez80dbg.py --gui
 
 Device string (--device DEV)
@@ -54,9 +56,15 @@ Device string (--device DEV)
 """
 
 import os
+import io
 import sys
 import time
+import socket
+import select
+import atexit
 import argparse
+import threading
+import contextlib
 
 try:
     from pyftdi.ftdi import Ftdi
@@ -198,6 +206,12 @@ class ZDIDebugger:
         self._url  = _build_url(str(device))
         self._ftdi = None
         self._buf  = []
+        # The GUI and the socket monitor drive the same single ZDI link from
+        # two threads.  Every primitive below takes this lock so one MPSSE
+        # transaction can never be spliced into another's byte stream; callers
+        # hold it across whole sequences (PC save -> read -> PC restore) that
+        # must not be observed half-done.  Re-entrant, so nesting is free.
+        self.lock  = threading.RLock()
 
     # ---- connection --------------------------------------------------------
 
@@ -272,42 +286,46 @@ class ZDIDebugger:
         b += [0x80, RESET_PIN,             OUTPUT_MASK]
 
     def _zdi_write_reg(self, addr: int, value: int):
-        self._zdi_start()
-        self._codebyte((addr & 0x7F) << 1)
-        self._codebyte(value & 0xFF)
-        self._ft_write(self._buf)
+        with self.lock:
+            self._zdi_start()
+            self._codebyte((addr & 0x7F) << 1)
+            self._codebyte(value & 0xFF)
+            self._ft_write(self._buf)
 
     def _zdi_write_multiple(self, start_addr: int, data):
         """Write consecutive ZDI registers in one transaction."""
-        self._zdi_start()
-        self._codebyte((start_addr & 0x7F) << 1)
-        for b in data:
-            self._codebyte(b & 0xFF)
-        self._ft_write(self._buf)
+        with self.lock:
+            self._zdi_start()
+            self._codebyte((start_addr & 0x7F) << 1)
+            for b in data:
+                self._codebyte(b & 0xFF)
+            self._ft_write(self._buf)
 
     def _zdi_read_reg(self, addr: int) -> int:
         """Read one ZDI register (no extra clock-prep byte)."""
-        self._zdi_start()
-        self._codebyte(((addr & 0x7F) << 1) | 1)
-        self._buf += [0x20, 0, 0]                           # MPSSE: read 1 byte
-        self._buf += [0x80, RESET_PIN,        ZCL | RESET_PIN]
-        self._buf += [0x80, ZCL | RESET_PIN,  ZCL | RESET_PIN]
-        self._buf += [0x87]                                 # flush USB buffer
-        self._ft_write(self._buf)
-        return self._ft_read(1)[0]
+        with self.lock:
+            self._zdi_start()
+            self._codebyte(((addr & 0x7F) << 1) | 1)
+            self._buf += [0x20, 0, 0]                       # MPSSE: read 1 byte
+            self._buf += [0x80, RESET_PIN,        ZCL | RESET_PIN]
+            self._buf += [0x80, ZCL | RESET_PIN,  ZCL | RESET_PIN]
+            self._buf += [0x87]                             # flush USB buffer
+            self._ft_write(self._buf)
+            return self._ft_read(1)[0]
 
     def _zdi_read_multiple(self, start_addr: int, count: int) -> list:
         """Read count consecutive ZDI registers in one transaction."""
-        self._zdi_start()
-        self._codebyte(((start_addr & 0x7F) << 1) | 1)
-        self._buf += [0x80, ZCL | RESET_PIN, ZCL | RESET_PIN]   # clock prep
-        for _ in range(count):
-            self._buf += [0x20, 0, 0]
-            self._buf += [0x80, RESET_PIN,        ZCL | RESET_PIN]
-            self._buf += [0x80, ZCL | RESET_PIN,  ZCL | RESET_PIN]
-        self._buf += [0x87]
-        self._ft_write(self._buf)
-        return self._ft_read(count)
+        with self.lock:
+            self._zdi_start()
+            self._codebyte(((start_addr & 0x7F) << 1) | 1)
+            self._buf += [0x80, ZCL | RESET_PIN, ZCL | RESET_PIN]   # clock prep
+            for _ in range(count):
+                self._buf += [0x20, 0, 0]
+                self._buf += [0x80, RESET_PIN,        ZCL | RESET_PIN]
+                self._buf += [0x80, ZCL | RESET_PIN,  ZCL | RESET_PIN]
+            self._buf += [0x87]
+            self._ft_write(self._buf)
+            return self._ft_read(count)
 
     # ---- CPU control -------------------------------------------------------
 
@@ -315,6 +333,10 @@ class ZDIDebugger:
     def cpu_run(self):     self._zdi_write_reg(ZDI_BRK_CTL, BRK_RUN)
     def cpu_step(self):    self._zdi_write_reg(ZDI_BRK_CTL, BRK_STEP)
     def cpu_run_to_bp(self): self._zdi_write_reg(ZDI_BRK_CTL, BRK_RUN_BP)
+
+    def cpu_run_with_bps(self, enable_mask: int):
+        """Run with an explicit ADDR0..3 break-enable mask (0 = run freely)."""
+        self._zdi_write_reg(ZDI_BRK_CTL, enable_mask & 0x78)
 
 
     def read_status(self) -> int:
@@ -824,6 +846,639 @@ def cmd_reset(dbg, args):
 
 
 # ---------------------------------------------------------------------------
+# Unix-socket monitor  (protocol-compatible with NGZ80Evo_Tools_Emu --monitor)
+# ---------------------------------------------------------------------------
+#
+# A plain-text line protocol over a Unix domain socket, single-threaded, that
+# speaks exactly the same commands and answer shapes as the emulator's
+# monitor.c, so one client can drive either the emulator or real silicon.
+#
+# Protocol: one command per line in, one or more response lines out, always
+# terminated by a line that is either "OK" or "ERR <message>".  An unsolicited
+# "BREAK PC=xxxxxx" line can arrive at any time while `continue` is in effect.
+#
+#   regs                    dump registers
+#   mem <addr> [len]        hex+ASCII dump (addr/len in hex, len default 256)
+#   disasm <addr> [count]   disassemble `count` instructions (default 10)
+#   break <addr>            set a breakpoint (see note on data addresses below)
+#   unbreak <addr>          clear a breakpoint
+#   breaks                  list breakpoints
+#   step [n]                execute n instructions (default 1), synchronously
+#   continue | run | c      start free-running; replies immediately
+#   pause                   stop free-running
+#   reset                   reset + re-init the CPU, halted at PC=0
+#   quit | exit             close this connection
+#
+# ez80dbg-only extensions (the emulator answers "ERR unknown command"):
+#
+#   load <hexfile>          load an Intel HEX file into SRAM
+#   flash <hexfile>         program an Intel HEX file into internal flash
+#   setpc <addr>            set PC without running
+#   help                    list commands
+#
+# Differences forced by the hardware, all of them reported honestly:
+#   - only four breakpoints (the eZ80F91 has four ZDI address-match registers),
+#     where the emulator has sixteen; `break` beyond that answers ERR
+#   - those comparators watch the address bus, not just opcode fetches, so a
+#     `break` on a data address acts as a watchpoint -- it breaks at the end of
+#     the instruction that touched it.  There is no read/write qualifier and no
+#     data-value matching; the emulator breaks on PC only.
+#   - regs cannot report I, R and IM -- ZDI offers no path to them, so they
+#     read as 0.  IEF2 mirrors IEF1 for the same reason.
+#   - regs/mem/disasm need a halted CPU; while free-running they answer
+#     "ERR cpu is running" instead of a snapshot of a moving target.
+
+MONITOR_DEFAULT_SOCK    = '/tmp/ez80dbg.sock'   # fixed, so clients can hardcode it
+MONITOR_MAX_BREAKPOINTS = 4      # eZ80F91 ZDI address-match registers 0..3
+MONITOR_BP_ENABLE_BIT   = 0x08   # BRK_CTL bit for ADDR0; ADDR1..3 shift left
+MONITOR_STATUS_INTERVAL = 0.02   # seconds between halt polls while running
+MONITOR_ACC_LIMIT       = 512    # input line accumulator, as in monitor.c
+MONITOR_IDLE_TICK       = 0.2    # idle select() timeout, so stop() is noticed
+MONITOR_TRACE_LINES     = 12     # response lines a traced command shows before eliding
+
+NO_LINE = object()   # read_line(): nothing arrived, as opposed to a blank line
+
+# Commands after which the target's visible state may have moved, so a GUI
+# watching along has something to redraw.
+MONITOR_STATE_CHANGING = frozenset((
+    'step', 'continue', 'run', 'c', 'pause', 'reset', 'setpc', 'load', 'flash',
+))
+
+MONITOR_HELP = (
+    "regs | mem <addr> [len] | disasm <addr> [count]",
+    "break <addr> | unbreak <addr> | breaks",
+    "step [n] | continue | pause | reset",
+    "load <hexfile> | flash <hexfile> | setpc <addr>",
+    "quit",
+)
+
+
+class _MonitorError(Exception):
+    """Raised for a bad argument; the text goes straight into the ERR line."""
+
+
+def _mon_num(text: str, base: int) -> int:
+    try:
+        return int(text, base)
+    except ValueError:
+        kind = 'hex' if base == 16 else 'decimal'
+        raise _MonitorError(f'bad {kind} number: {text}') from None
+
+
+def _mon_flags_str(f: int) -> str:
+    """Flag string in monitor.c's spelling: set letter or '-', S Z H P N C."""
+    return ''.join(c if f & m else '-' for c, m in
+                   (('S', 0x80), ('Z', 0x40), ('H', 0x10),
+                    ('P', 0x04), ('N', 0x02), ('C', 0x01)))
+
+
+class _MonitorSession:
+    """One client connection's worth of state, plus the ZDI plumbing."""
+
+    def __init__(self, dbg: ZDIDebugger, sock_path: str, on_change=None,
+                 trace=None):
+        self.dbg       = dbg
+        self.sock_path = sock_path
+        self.on_change = on_change or (lambda: None)
+        # trace(command, response_lines) -- command is None for an unsolicited
+        # line.  Called from the serving thread, once per completed command, so
+        # a GUI gets whole request/response pairs rather than a line drip.
+        self.trace     = trace or (lambda cmd, lines: None)
+        self._traced   = []
+        self.bps       = []       # breakpoint addresses, in the order set
+        self.running   = False
+        self.conn      = None
+        self._acc      = b''
+
+    # ---- wire I/O ---------------------------------------------------------
+
+    def _write(self, text: str):
+        if self.conn is None:
+            return
+        try:
+            self.conn.sendall(text.encode('utf-8', 'replace'))
+        except OSError:
+            pass                  # peer gone; noticed on the next read
+
+    def reply(self, line: str = ''):
+        self._traced.append(line)
+        self._write(line + '\n')
+
+    def ok(self):
+        self._traced.append('OK')
+        self._write('OK\n')
+
+    def err(self, msg: str):
+        self._traced.append(f'ERR {msg}')
+        self._write(f'ERR {msg}\n')
+
+    def read_line(self, timeout):
+        """Return a decoded line, NO_LINE on timeout, or None on disconnect.
+
+        timeout is in seconds; None blocks until something arrives.  An empty
+        line is a real command (monitor.c answers "ERR empty command"), so it
+        must stay distinguishable from having read nothing at all.
+        """
+        while True:
+            nl = self._acc.find(b'\n')
+            if nl >= 0:
+                line = self._acc[:nl]
+                self._acc = self._acc[nl + 1:]
+                return line.decode('utf-8', 'replace').rstrip('\r')
+            r, _, _ = select.select([self.conn], [], [], timeout)
+            if not r:
+                return NO_LINE
+            try:
+                chunk = self.conn.recv(256)
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            self._acc += chunk
+            if len(self._acc) >= MONITOR_ACC_LIMIT:
+                self._acc = b''   # line too long: drop it rather than grow
+
+    # ---- target helpers ---------------------------------------------------
+
+    def ensure_halted(self) -> bool:
+        self.running = False
+        if self.dbg.is_halted():
+            return True
+        self.dbg.cpu_halt()
+        return self.dbg.wait_halt(timeout=2.0)
+
+    def phys_pc_now(self) -> int:
+        """Physical PC, MBASE-corrected in Z80 mode. CPU must be halted."""
+        adl = self.dbg.is_adl()
+        pc  = self.dbg.read_pc()
+        if adl:
+            return pc
+        regs = self.dbg.read_all_regs()
+        return phys_pc(regs, False)
+
+    def read_mem_keep_pc(self, addr: int, count: int) -> list:
+        """read_mem() drives PC as the address pointer, so save and restore."""
+        saved = self.dbg.read_pc()
+        try:
+            return self.dbg.read_mem(addr, count)
+        finally:
+            self.dbg.write_pc(saved)
+
+    def arm_breakpoints(self) -> int:
+        """Load self.bps into ADDR0.. and return the BRK_CTL enable mask."""
+        mask = 0
+        for i, addr in enumerate(self.bps[:MONITOR_MAX_BREAKPOINTS]):
+            self.dbg.set_breakpoint(i, addr)
+            mask |= MONITOR_BP_ENABLE_BIT << i
+        return mask
+
+    def step_off_breakpoint(self):
+        """Move off an address the break comparators are watching.
+
+        The ZDI_ADDRx comparators watch the address bus, so an opcode fetch at
+        a matching address breaks immediately (eZ80F91 PS019217, "ZDI Address
+        Match Registers").  Resuming while PC still sits on one therefore
+        matches again on the very next fetch and breaks instantly -- the CPU
+        never advances and every later breakpoint looks ignored.  BRK_STEP
+        writes 0x81, which leaves the four match-enable bits clear, so this
+        one instruction escapes the comparators.  monitor.c gets the same
+        effect for free by stepping before it tests the new PC.
+
+        A data match needs no such care: it breaks at the *end* of the
+        instruction that made the access, so PC is already past the watched
+        address and cannot re-trigger.
+        """
+        if self.bps and self.dbg.is_halted() and self.phys_pc_now() in self.bps:
+            self.dbg.cpu_step()
+            return self.dbg.wait_halt(HALT_TIMEOUT_DEFAULT)
+        return True
+
+    def start_running(self):
+        self.step_off_breakpoint()
+        self.dbg.cpu_run_with_bps(self.arm_breakpoints())
+        self.running = True
+
+    def rearm_if_running(self):
+        """Apply a breakpoint edit to a CPU that is already free-running.
+
+        The emulator tests its breakpoint list on every step, so `break` there
+        takes effect the moment it is typed; here the comparators have to be
+        reloaded to match that.  BRK_CTL is written with brk_next clear, which
+        updates the enables without disturbing execution.
+        """
+        if self.running:
+            self.dbg.cpu_run_with_bps(self.arm_breakpoints())
+
+    # ---- command output ---------------------------------------------------
+
+    def dump_regs(self):
+        dbg  = self.dbg
+        stat = dbg.read_status()
+        adl  = bool(stat & STAT_ADL)
+        regs = dbg.read_all_regs()
+        af  = (regs['A'] << 8) | regs['F']
+        bc  = (regs['BCU'] << 16) | (regs['B']   << 8) | regs['C']
+        de  = (regs['DEU'] << 16) | (regs['D']   << 8) | regs['E']
+        hl  = (regs['HLU'] << 16) | (regs['H']   << 8) | regs['L']
+        ix  = (regs['IXU'] << 16) | (regs['IXH'] << 8) | regs['IXL']
+        iy  = (regs['IYU'] << 16) | (regs['IYH'] << 8) | regs['IYL']
+        sps = regs['SPS_L'] | (regs['SPS_H'] << 8)
+        spl = regs['SPL_L'] | (regs['SPL_H'] << 8) | (regs['SPL_U'] << 16)
+        pc  = phys_pc(regs, adl)
+        ief = 1 if stat & STAT_IEF else 0
+        self.reply(f"AF={af:04X} BC={bc:06X} DE={de:06X} HL={hl:06X}")
+        self.reply(f"IX={ix:06X} IY={iy:06X} SPS={sps:04X} SPL={spl:06X}")
+        # I, R and IM have no ZDI read path on the eZ80F91 -- reported as 0.
+        self.reply(f"PC={pc:06X} I=0000 R=00 MBASE={regs['MBASE']:02X}")
+        self.reply(
+            f"flags={_mon_flags_str(regs['F'])} ADL={1 if adl else 0} "
+            f"MADL={1 if stat & STAT_MIXED else 0} IM=0 "
+            f"IEF1={ief} IEF2={ief} "
+            f"halted={1 if stat & STAT_HALTED else 0}"
+        )
+        paf = (regs['pA'] << 8) | regs['pF']
+        pbc = (regs['pBCU'] << 16) | (regs['pB'] << 8) | regs['pC']
+        pde = (regs['pDEU'] << 16) | (regs['pD'] << 8) | regs['pE']
+        phl = (regs['pHLU'] << 16) | (regs['pH'] << 8) | regs['pL']
+        self.reply(f"AF'={paf:04X} BC'={pbc:06X} DE'={pde:06X} HL'={phl:06X}")
+
+    def dump_mem(self, addr: int, length: int):
+        data = self.read_mem_keep_pc(addr, length)
+        for off in range(0, length, 16):
+            chunk = data[off:off + 16]
+            hexpart = ''.join(f'{b:02X} ' for b in chunk)
+            hexpart += '   ' * (16 - len(chunk))
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            self.reply(f"{(addr + off) & 0xFFFFFF:06X}: {hexpart} {ascii_part}")
+
+    def dump_disasm(self, addr: int, count: int):
+        pc  = self.phys_pc_now()
+        adl = self.dbg.is_adl()
+        # One read covering the whole run; the longest eZ80 opcode is 6 bytes.
+        span = min(count * 6 + 6, 0x10000)
+        data = self.read_mem_keep_pc(addr, span)
+        off = 0
+        for _ in range(count):
+            here = (addr + off) & 0xFFFFFF
+            mnemonic, length = 'db ?', 1
+            if HAS_DISASM and off < len(data):
+                try:
+                    dec      = ez80dis.decode(bytes(data[off:off + 6]), here, adl)
+                    mnemonic = ez80dis.disasm(dec)
+                    length   = max(1, dec.len)
+                except Exception:
+                    mnemonic = f'db {data[off]:02X}h'
+            self.reply(f"{'>' if here == pc else ' '}"
+                       f"{'*' if here in self.bps else ' '}"
+                       f"{here:06X}  {mnemonic}")
+            off += length
+
+    def forward_output(self, fn, *args):
+        """Run fn (which prints progress to stdout) and relay it to the client."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fn(*args)
+        for line in buf.getvalue().splitlines():
+            if line.strip():
+                self.reply(line.rstrip())
+
+    # ---- command dispatch -------------------------------------------------
+
+    def handle(self, line: str) -> bool:
+        """Run one command. Returns True if the connection should close."""
+        self._traced = []
+        try:
+            return self._handle(line)
+        finally:
+            self.trace(line, self._traced)
+
+    def _handle(self, line: str) -> bool:
+        parts = line.split()
+        if not parts:
+            self.err('empty command')
+            return False
+        cmd, args = parts[0], parts[1:]
+
+        # One command is one transaction against the target: the GUI thread
+        # must not slip a PC-clobbering read in between our PC save and
+        # restore, so the whole dispatch runs under the ZDI lock.
+        try:
+            with self.dbg.lock:
+                return self._dispatch(cmd, args)
+        except _MonitorError as e:
+            self.err(str(e))
+            return False
+        except Exception as e:
+            self.err(f'{type(e).__name__}: {e}')
+            return False
+
+    def _dispatch(self, cmd: str, args) -> bool:
+        needs_halt = cmd in ('regs', 'mem', 'disasm', 'load', 'flash', 'setpc')
+        if needs_halt and self.running:
+            self.err('cpu is running')
+            return False
+
+        if cmd == 'regs':
+            self.dump_regs()
+
+        elif cmd == 'mem':
+            if not args:
+                self.err('usage: mem <addr> [len]')
+                return False
+            addr   = _mon_num(args[0], 16) & 0xFFFFFF
+            length = _mon_num(args[1], 16) if len(args) > 1 else 256
+            length = 16 if length <= 0 else min(length, 4096)
+            self.dump_mem(addr, length)
+
+        elif cmd == 'disasm':
+            if not args:
+                self.err('usage: disasm <addr> [count]')
+                return False
+            addr  = _mon_num(args[0], 16) & 0xFFFFFF
+            count = _mon_num(args[1], 10) if len(args) > 1 else 10
+            count = max(1, min(count, 256))
+            self.dump_disasm(addr, count)
+
+        elif cmd == 'break':
+            if not args:
+                self.err('usage: break <addr>')
+                return False
+            addr = _mon_num(args[0], 16) & 0xFFFFFF
+            if addr not in self.bps:
+                if len(self.bps) >= MONITOR_MAX_BREAKPOINTS:
+                    self.err(f'too many breakpoints (hardware limit '
+                             f'{MONITOR_MAX_BREAKPOINTS})')
+                    return False
+                self.bps.append(addr)
+            self.rearm_if_running()
+            self.reply(f'breakpoint set at {addr:06X}')
+
+        elif cmd == 'unbreak':
+            if not args:
+                self.err('usage: unbreak <addr>')
+                return False
+            addr = _mon_num(args[0], 16) & 0xFFFFFF
+            if addr in self.bps:
+                self.bps.remove(addr)
+                self.rearm_if_running()
+            self.reply(f'breakpoint cleared at {addr:06X}')
+
+        elif cmd == 'breaks':
+            for addr in self.bps:
+                self.reply(f'{addr:06X}')
+
+        elif cmd == 'step':
+            count = _mon_num(args[0], 10) if args else 1
+            count = max(1, min(count, 1000000))
+            if not self.ensure_halted():
+                self.err('cpu did not halt')
+                return False
+            for _ in range(count):
+                self.dbg.cpu_step()
+                if not self.dbg.wait_halt(HALT_TIMEOUT_DEFAULT):
+                    self.err('cpu did not halt after step (timeout)')
+                    return False
+            self.reply(f'PC={self.phys_pc_now():06X}')
+
+        elif cmd in ('continue', 'run', 'c'):
+            self.start_running()
+            self.reply('running')
+
+        elif cmd == 'pause':
+            if not self.ensure_halted():
+                self.err('cpu did not halt')
+                return False
+            self.reply(f'paused PC={self.phys_pc_now():06X}')
+
+        elif cmd == 'reset':
+            self.running = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.dbg.cpu_reset()
+            self.reply(f'reset PC={self.phys_pc_now():06X}')
+
+        elif cmd == 'load':
+            if not args:
+                self.err('usage: load <hexfile>')
+                return False
+            self.forward_output(self.dbg.load_sram, args[0])
+
+        elif cmd == 'flash':
+            if not args:
+                self.err('usage: flash <hexfile>')
+                return False
+            self.forward_output(self.dbg.flash_file, args[0])
+            self.bps.clear()      # the helper run reprogrammed ADDR0
+
+        elif cmd == 'setpc':
+            if not args:
+                self.err('usage: setpc <addr>')
+                return False
+            addr = _mon_num(args[0], 16) & 0xFFFFFF
+            if not self.ensure_halted():
+                self.err('cpu did not halt')
+                return False
+            self.dbg.write_pc(addr)
+            self.reply(f'PC={self.phys_pc_now():06X}')
+
+        elif cmd == 'help':
+            for line in MONITOR_HELP:
+                self.reply(line)
+
+        elif cmd in ('quit', 'exit'):
+            self.reply('bye')
+            self.ok()
+            return True
+
+        else:
+            self.err('unknown command')
+            return False
+
+        if cmd in MONITOR_STATE_CHANGING:
+            self.on_change()
+        self.ok()
+        return False
+
+
+class MonitorServer:
+    """The socket monitor, usable blocking (CLI) or on its own thread (GUI).
+
+    The GUI case is the reason this is a class: the user brings the target
+    into a sane state by hand, then hands the same live ZDI link to a socket
+    client while the window stays usable.  Both sides serialise on
+    ``dbg.lock``; `log`, `on_change` and `trace` are called from the serving
+    thread, so a GUI must marshal them back to its own thread itself.
+    """
+
+    def __init__(self, dbg: ZDIDebugger, sock_path: str = MONITOR_DEFAULT_SOCK,
+                 log=print, on_change=None, trace=None):
+        self.dbg       = dbg
+        self.sock_path = sock_path
+        self.log       = log
+        self.session   = _MonitorSession(dbg, sock_path, on_change=on_change,
+                                         trace=trace)
+        self._srv      = None
+        self._thread   = None
+        self._stop     = threading.Event()
+
+    # ---- lifecycle --------------------------------------------------------
+
+    @property
+    def active(self) -> bool:
+        return self._srv is not None
+
+    def bind(self):
+        """Create the listening socket. Raises on failure; call before serve."""
+        if not hasattr(socket, 'AF_UNIX'):
+            raise RuntimeError('Unix domain sockets are not available on this platform')
+        if os.path.exists(self.sock_path):
+            if self._is_live_socket(self.sock_path):
+                raise RuntimeError(f'{self.sock_path} is already served by another process')
+            os.unlink(self.sock_path)      # stale file from a crashed run
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            srv.bind(self.sock_path)
+            srv.listen(1)
+        except OSError:
+            srv.close()
+            raise
+        self._srv = srv
+        self._stop.clear()
+
+    @staticmethod
+    def _is_live_socket(path: str) -> bool:
+        """True if something is actually accepting on this path right now."""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.2)
+            probe.connect(path)
+            return True
+        except OSError:
+            return False
+        finally:
+            probe.close()
+
+    def start(self):
+        """Bind and serve on a daemon thread; returns once the socket is up."""
+        self.bind()
+        self._thread = threading.Thread(target=self._serve, name='ez80dbg-monitor',
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0):
+        """Ask the serving thread to finish and clean up the socket file."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+        self._close()
+
+    def serve_forever(self):
+        """Blocking serve for the CLI; returns on Ctrl-C."""
+        try:
+            self._serve()
+        except KeyboardInterrupt:
+            self.log("Monitor stopped.")
+        finally:
+            self._stop.set()
+            self._close()
+
+    def _close(self):
+        session = self.session
+        if session.conn is not None:
+            try:
+                session.conn.close()
+            except OSError:
+                pass
+            session.conn = None
+        if self._srv is not None:
+            self._srv.close()
+            self._srv = None
+        if os.path.exists(self.sock_path):
+            try:
+                os.unlink(self.sock_path)
+            except OSError:
+                pass
+
+    # ---- the loop ---------------------------------------------------------
+
+    def _serve(self):
+        session = self.session
+        srv     = self._srv
+        next_status_check = 0.0
+
+        while not self._stop.is_set():
+            # Idle waits are bounded so stop() is noticed promptly; while the
+            # target free-runs we do not wait on the socket at all, because the
+            # halt poll below has to keep turning.
+            wait = 0 if session.running else MONITOR_IDLE_TICK
+
+            if session.conn is None:
+                try:
+                    r, _, _ = select.select([srv], [], [], wait)
+                except (OSError, ValueError):
+                    break
+                if r:
+                    session.conn, _ = srv.accept()
+                    session._acc = b''
+                    session._write('ez80dbg monitor ready\n')
+                    self.log("Monitor: client connected.")
+
+            if session.conn is not None:
+                line = session.read_line(wait)
+                if line is None:
+                    session.conn.close()
+                    session.conn = None
+                    self.log("Monitor: client disconnected.")
+                elif line is not NO_LINE:
+                    if session.handle(line):
+                        session.conn.close()
+                        session.conn = None
+                        self.log("Monitor: client disconnected.")
+
+            if session.running:
+                now = time.monotonic()
+                if now < next_status_check:
+                    time.sleep(min(MONITOR_STATUS_INTERVAL, next_status_check - now))
+                    continue
+                next_status_check = now + MONITOR_STATUS_INTERVAL
+                if self.dbg.is_halted():
+                    session.running = False
+                    session._traced = []
+                    session.reply(f'BREAK PC={session.phys_pc_now():06X}')
+                    session.trace(None, session._traced)
+                    session.on_change()
+
+
+def monitor_run(dbg: ZDIDebugger, sock_path: str = MONITOR_DEFAULT_SOCK,
+                attach: bool = False) -> int:
+    """Serve the monitor protocol on a Unix socket until interrupted (CLI)."""
+    server  = MonitorServer(dbg, sock_path)
+    session = server.session
+
+    if attach:
+        state = 'halted' if dbg.is_halted() else 'running'
+        session.running = (state == 'running')
+        print(f"Attached to a {state} CPU.")
+    elif not session.ensure_halted():
+        print("Warning: CPU did not halt; attaching anyway.")
+
+    server.bind()
+    atexit.register(server._close)
+    print(f"Monitor listening on {sock_path} "
+          f"({'attached' if attach else 'halted'}; send 'continue' to start)")
+    print(f"Connect with:  socat readline UNIX-CONNECT:{sock_path}")
+    server.serve_forever()
+    return 0
+
+
+def cmd_monitor(dbg, args):
+    """Serve the Unix-socket debug protocol (same commands as the emulator).
+    socket: path to create, default /tmp/ez80dbg.sock.
+    --attach: leave the CPU alone on start instead of halting it."""
+    monitor_run(dbg, args.socket or MONITOR_DEFAULT_SOCK, attach=args.attach)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -924,6 +1579,12 @@ device string examples:
     s.add_argument('--run', type=_auto_int, default=None, metavar='ADDR',
                    help='Run from ADDR after reset')
 
+    s = sub.add_parser('monitor', help='Serve the Unix-socket debug protocol')
+    s.add_argument('socket', nargs='?', default=None,
+                   help=f'Socket path (default: {MONITOR_DEFAULT_SOCK})')
+    s.add_argument('--attach', action='store_true',
+                   help='Do not halt the CPU on start')
+
 
 
     return p
@@ -936,7 +1597,30 @@ device string examples:
 def launch_gui(device: str):
     import tkinter as tk
     from tkinter import ttk, filedialog, scrolledtext, messagebox
-    import io, contextlib, threading, queue as _queue
+    import io, functools, contextlib, queue as _queue
+
+    def _target_action(what, timeout=5.0):
+        """Toolbar action that needs a connection and exclusive ZDI access.
+
+        The socket monitor drives the same link from its own thread, so an
+        action arriving mid-command waits briefly and then says so, rather
+        than splicing itself into the middle of that command.
+        """
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrapper(self, *a, **kw):
+                if not self.dbg:
+                    messagebox.showerror("Not connected", "Connect first.")
+                    return None
+                if not self.dbg.lock.acquire(timeout=timeout):
+                    self._log(f"Busy: the monitor holds the ZDI link, {what} skipped.")
+                    return None
+                try:
+                    return fn(self, *a, **kw)
+                finally:
+                    self.dbg.lock.release()
+            return wrapper
+        return deco
 
     class App:
         def __init__(self, root: tk.Tk):
@@ -944,9 +1628,13 @@ def launch_gui(device: str):
             self.dbg        = None
             self._device    = device
             self._prev_regs = None
+            self.monitor    = None
+            self._mon_q     = _queue.SimpleQueue()   # monitor thread -> GUI thread
             root.title("eZ80F91 ZDI Debugger")
             root.minsize(860, 520)
             self._build_ui()
+            root.protocol('WM_DELETE_WINDOW', self._on_close)
+            self._pump_monitor()
 
         def _build_ui(self):
             tb = ttk.Frame(self.root, padding=(4, 2))
@@ -983,6 +1671,13 @@ def launch_gui(device: str):
                 for label, cmd in group:
                     ttk.Button(tb, text=label, command=cmd, width=10).pack(
                         side='left', padx=1, pady=1)
+
+            ttk.Separator(tb, orient='vertical').pack(side='left', fill='y', padx=3)
+            self.mon_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(tb, text="Monitor", style='Toolbutton', width=10,
+                            variable=self.mon_var,
+                            command=self._toggle_monitor).pack(
+                                side='left', padx=1, pady=1)
 
         def _build_left(self, parent):
             rf = ttk.LabelFrame(parent, text="Registers", padding=4)
@@ -1109,6 +1804,106 @@ def launch_gui(device: str):
                 return False
             return True
 
+        def _locked(self, fn):
+            """Wrap a worker-thread callable so it owns the ZDI link while it runs."""
+            def run(*a, **kw):
+                with self.dbg.lock:
+                    return fn(*a, **kw)
+            return run
+
+        # monitor
+
+        def _toggle_monitor(self):
+            if self.mon_var.get():
+                self._monitor_start()
+            else:
+                self._monitor_stop()
+
+        def _monitor_start(self):
+            if not self.dbg:
+                messagebox.showerror("Not connected", "Connect first.")
+                self.mon_var.set(False)
+                return
+            if self.monitor is not None:
+                return
+            server = MonitorServer(self.dbg, MONITOR_DEFAULT_SOCK,
+                                   log=self._mon_log, on_change=self._mon_changed,
+                                   trace=self._mon_trace)
+            # Take the target exactly as the user left it -- getting it into a
+            # sane state by hand first is the whole point of this button.
+            server.session.running = not self.dbg.is_halted()
+            try:
+                server.start()
+            except Exception as e:
+                self._log(f"Monitor failed to start: {e}")
+                self.mon_var.set(False)
+                return
+            self.monitor = server
+            self._log(f"Monitor listening on {MONITOR_DEFAULT_SOCK}")
+            self._log(f"  socat readline UNIX-CONNECT:{MONITOR_DEFAULT_SOCK}")
+            self.status_var.set(f"Monitor on {MONITOR_DEFAULT_SOCK}")
+
+        def _monitor_stop(self):
+            if self.monitor is not None:
+                self.monitor.stop()
+                self.monitor = None
+                self._log("Monitor stopped.")
+                self.status_var.set("Monitor off")
+            self.mon_var.set(False)
+
+        def _mon_log(self, msg):
+            self._mon_q.put(('log', str(msg)))       # called from the monitor thread
+
+        def _mon_changed(self):
+            self._mon_q.put(('refresh', None))       # called from the monitor thread
+
+        def _mon_trace(self, cmd, lines):
+            """One socket command and its answer, for the log (monitor thread).
+
+            Long dumps are elided here rather than in the log so a `mem` of a
+            few KB cannot bury the rest of the window.
+            """
+            shown = list(lines[:MONITOR_TRACE_LINES])
+            if len(lines) > MONITOR_TRACE_LINES:
+                shown.append(f'... ({len(lines) - MONITOR_TRACE_LINES} more lines)')
+            self._mon_q.put(('trace', (cmd, shown)))
+
+        def _pump_monitor(self):
+            """Drain the monitor thread's messages; Tk is touched only here."""
+            refresh = False
+            while True:
+                try:
+                    kind, payload = self._mon_q.get_nowait()
+                except _queue.Empty:
+                    break
+                if kind == 'log':
+                    self._log(payload)
+                elif kind == 'trace':
+                    cmd, lines = payload
+                    # 'socket>' what the client asked, 'socket<' a line it got
+                    # without asking (a BREAK), indented for everything else.
+                    if cmd is None:
+                        for line in lines:
+                            self._log(f'socket< {line}')
+                    else:
+                        self._log(f'socket> {cmd}')
+                        for line in lines:
+                            self._log(f'        {line}')
+                else:
+                    refresh = True                   # coalesce a burst into one
+            # Skip the auto-refresh while the monitor is mid-command (a flash
+            # holds the link for minutes); its next state change queues another.
+            if refresh and self.dbg and self.dbg.lock.acquire(blocking=False):
+                self.dbg.lock.release()
+                self._refresh_regs()
+            self.root.after(200, self._pump_monitor)
+
+        def _on_close(self):
+            self._monitor_stop()
+            if self.dbg:
+                self.dbg.close()
+            self.root.destroy()
+
         # toolbar actions
 
         def _connect(self):
@@ -1132,14 +1927,15 @@ def launch_gui(device: str):
                 self._log(f"Connect failed: {e}")
 
         def _disconnect(self):
+            self._monitor_stop()
             if self.dbg:
                 self.dbg.close(); self.dbg = None
                 self._prev_regs = None
                 self.status_var.set("Disconnected")
                 self._log("Disconnected.")
 
+        @_target_action('reset')
         def _reset(self):
-            if not self._need_dbg(): return
             buf = io.StringIO()
             try:
                 with contextlib.redirect_stdout(buf):
@@ -1151,28 +1947,28 @@ def launch_gui(device: str):
             if buf.getvalue(): self._log(buf.getvalue().strip())
             self._refresh_regs()
 
+        @_target_action('halt')
         def _halt(self):
-            if not self._need_dbg(): return
             self.dbg.cpu_halt()
             self._log("Halted.")
             self._refresh_regs()
 
+        @_target_action('run')
         def _run(self):
-            if not self._need_dbg(): return
             self.dbg.cpu_run()
             self.status_var.set("Running")
             self._log("Running.")
 
+        @_target_action('step')
         def _step(self):
-            if not self._need_dbg(): return
             self.dbg.cpu_step()
             if not self.dbg.wait_halt(timeout=2.0):
                 self._log("Did not halt after step."); return
             self._log("Stepped.")
             self._refresh_regs()
 
+        @_target_action('set PC')
         def _set_pc(self):
-            if not self._need_dbg(): return
             try:
                 addr = int(self.pc_entry.get().strip(), 16)
                 self.dbg.write_pc(addr)
@@ -1181,8 +1977,8 @@ def launch_gui(device: str):
             except ValueError:
                 self._log("Bad address (hex, no 0x prefix)")
 
+        @_target_action('run-from')
         def _run_from(self):
-            if not self._need_dbg(): return
             try:
                 addr = int(self.pc_entry.get().strip(), 16)
                 self.dbg.write_pc(addr)
@@ -1192,11 +1988,16 @@ def launch_gui(device: str):
             except ValueError:
                 self._log("Bad address (hex, no 0x prefix)")
 
+        @_target_action('refresh')
         def _refresh_regs(self):
-            if not self._need_dbg(): return
             try:
-                regs = self.dbg.read_all_regs()
                 stat = self.dbg.read_status()
+                if not stat & STAT_ZDI:
+                    # CPU is free-running: reading now would clobber PC and
+                    # report noise.  Halt (or let a breakpoint hit) first.
+                    self.status_var.set("Running - halt to read registers")
+                    return
+                regs = self.dbg.read_all_regs()
                 adl   = bool(stat & STAT_ADL)
                 halt  = bool(stat & STAT_HALTED)
                 ief   = bool(stat & STAT_IEF)
@@ -1303,8 +2104,8 @@ def launch_gui(device: str):
             except Exception as e:
                 self._log(f"Register read failed: {e}")
 
+        @_target_action('breakpoint run')
         def _set_bp_run(self):
-            if not self._need_dbg(): return
             try:
                 addr = int(self.bp_entry.get().strip(), 16)
                 self.dbg.set_breakpoint(0, addr)
@@ -1323,8 +2124,8 @@ def launch_gui(device: str):
             else:
                 self.root.after(200, self._poll_halt)
 
+        @_target_action('dump')
         def _mem_dump(self):
-            if not self._need_dbg(): return
             try:
                 addr   = int(self.md_addr.get().strip(), 16)
                 length = int(self.md_len.get().strip(), 16)
@@ -1354,9 +2155,10 @@ def launch_gui(device: str):
                 filetypes=[('Binary', '*.bin'), ('All', '*.*')])
             if not path: return
             try:
-                saved = self.dbg.read_pc()
-                data  = self.dbg.read_mem(addr, length)
-                self.dbg.write_pc(saved)
+                with self.dbg.lock:
+                    saved = self.dbg.read_pc()
+                    data  = self.dbg.read_mem(addr, length)
+                    self.dbg.write_pc(saved)
                 with open(path, 'wb') as f:
                     f.write(bytes(data))
                 self._log(f"Saved {length} bytes from {addr:06X} to {path}")
@@ -1370,7 +2172,7 @@ def launch_gui(device: str):
                 filetypes=[("Intel HEX", "*.hex *.HEX"), ("All files", "*.*")])
             if path:
                 self._log(f"Flashing {path}...")
-                self._run_async(self.dbg.flash_file, path)
+                self._run_async(self._locked(self.dbg.flash_file), path)
 
         def _load_dialog(self):
             if not self._need_dbg(): return
@@ -1379,7 +2181,7 @@ def launch_gui(device: str):
                 filetypes=[("Intel HEX", "*.hex *.HEX"), ("All files", "*.*")])
             if path:
                 self._log(f"Loading {path} to SRAM...")
-                self._run_async(self.dbg.load_sram, path)
+                self._run_async(self._locked(self.dbg.load_sram), path)
 
 
     root = tk.Tk()
@@ -1399,6 +2201,7 @@ _COMMANDS = {
     'dump':   cmd_dump,
     'regs':   cmd_regs,
     'reset':  cmd_reset,
+    'monitor': cmd_monitor,
 }
 
 def main():
